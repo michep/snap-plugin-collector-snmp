@@ -28,12 +28,12 @@ import (
 	"sync"
 	"time"
 
-	log "github.com/sirupsen/logrus"
 	"github.com/intelsdi-x/snap-plugin-collector-snmp/collector/configReader"
 	"github.com/intelsdi-x/snap-plugin-collector-snmp/collector/snmp"
 	"github.com/intelsdi-x/snap-plugin-lib-go/v1/plugin"
 	"github.com/intelsdi-x/snap/core"
 	"github.com/k-sone/snmpgo"
+	log "github.com/sirupsen/logrus"
 )
 
 const (
@@ -144,8 +144,6 @@ func (p *Plugin) GetMetricTypes(cfg plugin.Config) ([]plugin.Metric, error) {
 // CollectMetrics returns list of requested metric values
 // It returns error in case retrieval was not successful
 func (p *Plugin) CollectMetrics(metrics []plugin.Metric) ([]plugin.Metric, error) {
-	var mtxMetrics sync.Mutex
-	var wgCollectedMetrics sync.WaitGroup
 
 	//initialization of plugin structure (only once)
 	if !p.initialized {
@@ -202,98 +200,78 @@ func (p *Plugin) CollectMetrics(metrics []plugin.Metric) ([]plugin.Metric, error
 			return nil, err
 		}
 
-		wgCollectedMetrics.Add(len(metricsConfigs))
-
 		for _, cfg := range metricsConfigs {
 
-			go func(cfg configReader.Metric) {
+			//get value of metric/metrics
+			results, err := snmp_.readElements(conn.handler, cfg.Oid, cfg.Mode)
+			if err != nil {
+				log.Warn(err)
+			}
 
-				defer wgCollectedMetrics.Done()
+			resultMap, err := snmpResults2Map(results, cfg.Oid)
+			if err != nil {
+				log.Warn(err)
+				continue
+			}
 
-				conn.mtx.Lock()
+			//get dynamic elements of namespace parts
+			err = getDynamicNamespaceElements(conn.handler, resultMap, &cfg)
+			if err != nil {
+				log.Warn(err)
+				continue
+			}
 
-				//get value of metric/metrics
-				results, err := snmp_.readElements(conn.handler, cfg.Oid, cfg.Mode)
+			for i, result := range resultMap {
+
+				//build namespace for metric
+				namespace := plugin.NewNamespace(Vendor, PluginName)
+				offset := len(namespace)
+				for j, ns := range cfg.Namespace {
+					if ns.Source == configReader.NsSourceString {
+						namespace = namespace.AddStaticElements(ns.String)
+					} else {
+						namespace = namespace.AddDynamicElement(ns.Name, ns.Description)
+						namespace[j+offset].Value = ns.Values[i]
+					}
+				}
+
+				//convert metric types
+				val, err := convertSnmpDataToMetric(result.Variable.String(), result.Variable.Type())
 				if err != nil {
 					log.Warn(err)
-					conn.mtx.Unlock()
-					return
+					continue
 				}
 
-				resultMap, err := snmpResults2Map(results, cfg.Oid)
+				//modify numeric metric - use scale and shift parameters
+				data := modifyNumericMetric(val, cfg.Scale, cfg.Shift)
+
+				//creating metric
+				mt := plugin.Metric{
+					Namespace: namespace,
+					Data:      data,
+					Timestamp: time.Now(),
+					Tags: map[string]string{
+						tagSnmpAgentName:    agentConfig.Name,
+						tagSnmpAgentAddress: agentConfig.Address,
+						tagOid:              result.Oid.String()},
+					Unit:        metric.Unit,
+					Description: metric.Description,
+				}
+
+				//filter specific instance
+				nsPattern := strings.Replace(metric.Namespace.String(), "*", ".*", -1)
+				matched, err := regexp.MatchString(nsPattern, mt.Namespace.String())
 				if err != nil {
-					log.Warn(err)
-					conn.mtx.Unlock()
-					return
+					logFields := map[string]interface{}{"namespace": mt.Namespace.String(), "pattern": nsPattern, "match_error": err}
+					err := fmt.Errorf("Cannot parse namespace element for matching")
+					log.WithFields(logFields).Warn(err)
+					continue
 				}
-
-				//get dynamic elements of namespace parts
-				err = getDynamicNamespaceElements(conn.handler, resultMap, &cfg)
-				if err != nil {
-					conn.mtx.Unlock()
-					return
+				if matched {
+					mts = append(mts, mt)
 				}
-
-				conn.lastUsed = time.Now()
-				conn.mtx.Unlock()
-
-				for i, result := range resultMap {
-
-					//build namespace for metric
-					namespace := plugin.NewNamespace(Vendor, PluginName)
-					offset := len(namespace)
-					for j, ns := range cfg.Namespace {
-						if ns.Source == configReader.NsSourceString {
-							namespace = namespace.AddStaticElements(ns.String)
-						} else {
-							namespace = namespace.AddDynamicElement(ns.Name, ns.Description)
-							namespace[j+offset].Value = ns.Values[i]
-						}
-					}
-
-					//convert metric types
-					val, err := convertSnmpDataToMetric(result.Variable.String(), result.Variable.Type())
-					if err != nil {
-						continue
-					}
-
-					//modify numeric metric - use scale and shift parameters
-					data := modifyNumericMetric(val, cfg.Scale, cfg.Shift)
-
-					//creating metric
-					mt := plugin.Metric{
-						Namespace: namespace,
-						Data:      data,
-						Timestamp: time.Now(),
-						Tags: map[string]string{
-							tagSnmpAgentName:    agentConfig.Name,
-							tagSnmpAgentAddress: agentConfig.Address,
-							tagOid:              result.Oid.String()},
-						Unit:        metric.Unit,
-						Description: metric.Description,
-					}
-
-					//adding metric to list of metrics
-					mtxMetrics.Lock()
-
-					//filter specific instance
-					nsPattern := strings.Replace(metric.Namespace.String(), "*", ".*", -1)
-					matched, err := regexp.MatchString(nsPattern, mt.Namespace.String())
-					if err != nil {
-						logFields := map[string]interface{}{"namespace": mt.Namespace.String(), "pattern": nsPattern, "match_error": err}
-						err := fmt.Errorf("Cannot parse namespace element for matching")
-						log.WithFields(logFields).Warn(err)
-						return
-					}
-					if matched {
-						mts = append(mts, mt)
-					}
-
-					mtxMetrics.Unlock()
-				}
-			}(cfg)
+			}
 		}
-		wgCollectedMetrics.Wait()
 	}
 	return mts, nil
 }
