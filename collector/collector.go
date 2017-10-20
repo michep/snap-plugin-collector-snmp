@@ -28,7 +28,7 @@ import (
 	"sync"
 	"time"
 
-	log "github.com/Sirupsen/logrus"
+	log "github.com/sirupsen/logrus"
 	"github.com/intelsdi-x/snap-plugin-collector-snmp/collector/configReader"
 	"github.com/intelsdi-x/snap-plugin-collector-snmp/collector/snmp"
 	"github.com/intelsdi-x/snap-plugin-lib-go/v1/plugin"
