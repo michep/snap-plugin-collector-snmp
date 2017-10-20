@@ -32,7 +32,6 @@ import (
 	"github.com/intelsdi-x/snap-plugin-collector-snmp/collector/configReader"
 	"github.com/intelsdi-x/snap-plugin-collector-snmp/collector/snmp"
 	"github.com/intelsdi-x/snap-plugin-lib-go/v1/plugin"
-	"github.com/intelsdi-x/snap-plugin-utilities/ns"
 	"github.com/intelsdi-x/snap/core"
 	"github.com/k-sone/snmpgo"
 )
@@ -221,8 +220,15 @@ func (p *Plugin) CollectMetrics(metrics []plugin.Metric) ([]plugin.Metric, error
 					return
 				}
 
+				resultMap, err := snmpResults2Map(results, cfg.Oid)
+				if err != nil {
+					log.Warn(err)
+					conn.mtx.Unlock()
+					return
+				}
+
 				//get dynamic elements of namespace parts
-				err = getDynamicNamespaceElements(conn.handler, results, &cfg)
+				err = getDynamicNamespaceElements(conn.handler, resultMap, &cfg)
 				if err != nil {
 					conn.mtx.Unlock()
 					return
@@ -231,7 +237,7 @@ func (p *Plugin) CollectMetrics(metrics []plugin.Metric) ([]plugin.Metric, error
 				conn.lastUsed = time.Now()
 				conn.mtx.Unlock()
 
-				for i, result := range results {
+				for i, result := range resultMap {
 
 					//build namespace for metric
 					namespace := plugin.NewNamespace(Vendor, PluginName)
@@ -348,10 +354,10 @@ func watchConnections() {
 }
 
 //getDynamicNamespaceElements gets dynamic elements of namespace, either sending SNMP requests or using part of OID
-func getDynamicNamespaceElements(handler *snmpgo.SNMP, results []*snmpgo.VarBind, metric *configReader.Metric) error {
+func getDynamicNamespaceElements(handler *snmpgo.SNMP, resultMap map[string]*snmpgo.VarBind, metric *configReader.Metric) error {
 	for i := 0; i < len(metric.Namespace); i++ {
 		//clear slice with dynamic parts of namespace
-		metric.Namespace[i].Values = []string{}
+		metric.Namespace[i].Values = make(map[string]string)
 
 		switch metric.Namespace[i].Source {
 
@@ -363,13 +369,21 @@ func getDynamicNamespaceElements(handler *snmpgo.SNMP, results []*snmpgo.VarBind
 			if err != nil {
 				return err
 			}
-			for _, part := range parts {
-				metricNamePart := ns.ReplaceNotAllowedCharsInNamespacePart(part.Variable.String())
-				metric.Namespace[i].Values = append(metric.Namespace[i].Values, metricNamePart)
+
+			partsMap, serr := snmpResults2Map(parts, metric.Namespace[i].Oid)
+			if serr != nil {
+				return serr
+			}
+
+			for idx, part := range partsMap {
+				if _, ok := resultMap[idx]; ok {
+					metricNamePart := ReplaceNotAllowedCharsInNamespacePart(part.Variable.String())
+					metric.Namespace[i].Values[idx] = metricNamePart
+				}
 			}
 
 		case configReader.NsSourceIndex:
-			for _, r := range results {
+			for _, r := range resultMap {
 				oidParts := strings.Split(strings.Trim(r.Oid.String(), "."), ".")
 
 				if uint(len(oidParts)) <= metric.Namespace[i].OidPart {
@@ -382,19 +396,11 @@ func getDynamicNamespaceElements(handler *snmpgo.SNMP, results []*snmpgo.VarBind
 					log.WithFields(logFields).Warn(err)
 					return err
 				}
-				metric.Namespace[i].Values = append(metric.Namespace[i].Values, oidParts[metric.Namespace[i].OidPart])
+				idx := oidParts[metric.Namespace[i].OidPart]
+				metric.Namespace[i].Values[idx] = idx
 			}
 		}
 
-		if len(metric.Namespace[i].Values) != len(results) {
-			logFields := log.Fields{
-				"namespace_part_configuration": metric.Namespace[i],
-				"number_of_results":            len(results),
-				"number_of_namespace_elements": len(metric.Namespace[i].Values)}
-			err := fmt.Errorf("Incorrect configuration of dynamic elements of namespace, number of namespace elements is not equal to number of results")
-			log.WithFields(logFields).Warn(err)
-			return err
-		}
 	}
 	return nil
 }
@@ -485,4 +491,26 @@ func modifyNumericMetric(data interface{}, scale float64, shift float64) interfa
 		modifiedData = data
 	}
 	return modifiedData
+}
+
+func snmpResults2Map(results []*snmpgo.VarBind, oid string) (map[string]*snmpgo.VarBind, error) {
+	index := ""
+	res := make(map[string]*snmpgo.VarBind)
+	oidTrimmed := strings.Trim(oid, ".")
+	oidLen := len(strings.Split(oidTrimmed, "."))
+	for _, r := range results {
+		roidTrimmed := strings.Trim(r.Oid.String(), ".")
+		roidLen := len(strings.Split(roidTrimmed, "."))
+		if ((roidLen == oidLen) || (roidLen == oidLen+1)) && strings.HasPrefix(roidTrimmed, oidTrimmed) {
+			if roidLen == oidLen+1 {
+				index = strings.Split(roidTrimmed, ".")[oidLen]
+			} else {
+				index = strings.Split(roidTrimmed, ".")[oidLen-1]
+			}
+			res[index] = r
+		} else {
+			return nil, fmt.Errorf("Inconsistent Oid in response")
+		}
+	}
+	return res, nil
 }
