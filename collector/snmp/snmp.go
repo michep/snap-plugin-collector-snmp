@@ -27,156 +27,124 @@ import (
 	"time"
 
 	"github.com/intelsdi-x/snap-plugin-collector-snmp/collector/configReader"
-	"github.com/k-sone/snmpgo"
+	"github.com/soniah/gosnmp"
 )
 
-func NewHandler(agentConfig configReader.SnmpAgent) (*snmpgo.SNMP, error) {
-	handler, err := snmpgo.NewSNMP(snmpgo.SNMPArguments{
-		Version:          getSNMPVersion(agentConfig.SnmpVersion),
-		Network:          agentConfig.Network,
-		Address:          agentConfig.Address,
-		Timeout:          time.Duration(agentConfig.Timeout) * time.Second,
-		Retries:          agentConfig.Retries,
-		Community:        agentConfig.Community,
-		UserName:         agentConfig.UserName,
-		SecurityLevel:    getSNMPSecurityLevel(agentConfig.SecurityLevel),
-		AuthPassword:     agentConfig.AuthPassword,
-		AuthProtocol:     getSNMPAuthProtocol(agentConfig.AuthProtocol),
-		PrivPassword:     agentConfig.PrivPassword,
-		PrivProtocol:     getPrivProtocol(agentConfig.PrivProtocol),
-		SecurityEngineId: agentConfig.SecurityEngineId,
-		ContextEngineId:  agentConfig.ContextEngineId,
-		ContextName:      agentConfig.ContextName,
-	})
+func NewHandler(agentConfig configReader.SnmpAgent) (*gosnmp.GoSNMP, error) {
+	handler := gosnmp.Default
 
+	handler.Target = strings.Split(agentConfig.Address, ":")[0]
+	handler.Community = agentConfig.Community
+	handler.Version = getSNMPVersion(agentConfig.SnmpVersion)
+	handler.Timeout = time.Duration(agentConfig.Timeout) * time.Second
+	handler.Retries = int(agentConfig.Retries)
+
+	//handler, err := gosnmp.NewGoSNMP(gosnmp.SNMPArguments{
+	//	Version:          getSNMPVersion(agentConfig.SnmpVersion),
+	//	Network:          agentConfig.Network,
+	//	Address:          agentConfig.Address,
+	//	Timeout:          time.Duration(agentConfig.Timeout) * time.Second,
+	//	Retries:          agentConfig.Retries,
+	//	Community:        agentConfig.Community,
+	//	UserName:         agentConfig.UserName,
+	//	SecurityLevel:    getSNMPSecurityLevel(agentConfig.SecurityLevel),
+	//	AuthPassword:     agentConfig.AuthPassword,
+	//	AuthProtocol:     getSNMPAuthProtocol(agentConfig.AuthProtocol),
+	//	PrivPassword:     agentConfig.PrivPassword,
+	//	PrivProtocol:     getPrivProtocol(agentConfig.PrivProtocol),
+	//	SecurityEngineId: agentConfig.SecurityEngineId,
+	//	ContextEngineId:  agentConfig.ContextEngineId,
+	//	ContextName:      agentConfig.ContextName,
+	//})
+
+	err := handler.Connect()
 	if err != nil {
 		return nil, err
 	}
 	return handler, nil
 }
 
-func ReadElements(handler *snmpgo.SNMP, oid string, mode string) ([]*snmpgo.VarBind, error) {
-
+func ReadElements(handler *gosnmp.GoSNMP, oid string, mode string) ([]gosnmp.SnmpPDU, error) {
 	//results received through SNMP requests
-	results := []*snmpgo.VarBind{}
+	results := []gosnmp.SnmpPDU{}
 
-	if err := handler.Open(); err != nil {
+	defer handler.Conn.Close()
+	if err := handler.Connect(); err != nil {
 		// Failed to open connection
 		return results, err
 	}
 
-	//get elements in node OID
-	nodeOid := strings.Trim(oid, ".")
-	oidParts := strings.Split(nodeOid, ".")
-
-	//get length of node OID (used to stop reading in table and walk modes)
-	nodeOIDLength := len(oidParts)
-
-	//previous OID (used to stop reading in table and walk modes)
-	var prevOid string
-
-	//loop through one node of MIB
-	for {
-		oids, err := snmpgo.NewOids([]string{oid})
-		if err != nil {
-			// Failed to parse Oids
-			return results, err
-		}
-
-		var pdu snmpgo.Pdu
-		if mode == configReader.ModeSingle {
-			pdu, err = handler.GetRequest(oids)
-		} else {
-			pdu, err = handler.GetNextRequest(oids)
-		}
+	var err error
+	var sp *gosnmp.SnmpPacket
+	switch mode {
+	case configReader.ModeSingle:
+		sp, err = handler.Get([]string{oid})
 		if err != nil {
 			// Failed to request
 			return results, err
 		}
-
-		if pdu.ErrorStatus() != snmpgo.NoError {
+		if sp.Error != gosnmp.NoError {
 			// Received an error from the agent
-			return results, fmt.Errorf("Received an error from the SNMP agent: %v", pdu.ErrorStatus())
+			return results, fmt.Errorf("Received an error from the SNMP agent: %v", sp.Error)
 		}
-
-		if len(pdu.VarBinds()) != 1 {
-			return results, fmt.Errorf("Unaccepted number of results, received %v results", len(pdu.VarBinds()))
-		}
-
-		// select a VarBind
-		result := pdu.VarBinds()[0]
-
-		if mode == configReader.ModeSingle {
-			results = append(results, result)
-			break
-		} else {
-			oid = result.Oid.String()
-
-			//get current elements in node OID
-			currOidParts := strings.Split(strings.Trim(oid, "."), ".")
-
-			// if length of new oid is lower then it is the another node
-			if len(currOidParts) < nodeOIDLength {
-				break
-			}
-
-			currNodeOid := strings.Join(currOidParts[:nodeOIDLength], ".")
-
-			//check if there is a new element to read
-			if nodeOid != currNodeOid || prevOid == oid ||
-				(mode == configReader.ModeTable && (len(oidParts)+1) != len(currOidParts)) {
-				break
-			}
-			prevOid = oid
-			results = append(results, result)
+		results = sp.Variables
+	case configReader.ModeTable, configReader.ModeWalk:
+		results, err = handler.BulkWalkAll(oid)
+		if len(results) == 1 && results[0].Type == gosnmp.NoSuchObject {
+			return []gosnmp.SnmpPDU{}, nil
 		}
 	}
+	if err != nil {
+		// Failed to request
+		return results, err
+	}
+
 	return results, nil
 }
 
-func getSNMPVersion(s string) snmpgo.SNMPVersion {
-	var snmpVersion snmpgo.SNMPVersion
+func getSNMPVersion(s string) gosnmp.SnmpVersion {
+	var snmpVersion gosnmp.SnmpVersion
 	switch s {
 	case "v1":
-		snmpVersion = snmpgo.V1
+		snmpVersion = gosnmp.Version1
 	case "v2c":
-		snmpVersion = snmpgo.V2c
+		snmpVersion = gosnmp.Version2c
 	case "v3":
-		snmpVersion = snmpgo.V3
+		snmpVersion = gosnmp.Version3
 	}
 	return snmpVersion
 }
 
-func getSNMPSecurityLevel(s string) snmpgo.SecurityLevel {
-	var securitylevel snmpgo.SecurityLevel
+func getSNMPSecurityLevel(s string) gosnmp.SnmpV3MsgFlags {
+	var securitylevel gosnmp.SnmpV3MsgFlags
 	switch s {
 	case "NoAuthNoPriv":
-		securitylevel = snmpgo.NoAuthNoPriv
+		securitylevel = gosnmp.NoAuthNoPriv
 	case "AuthNoPriv":
-		securitylevel = snmpgo.AuthNoPriv
+		securitylevel = gosnmp.AuthNoPriv
 	case "AuthPriv":
-		securitylevel = snmpgo.AuthPriv
+		securitylevel = gosnmp.AuthPriv
 	}
 	return securitylevel
 }
-func getSNMPAuthProtocol(s string) snmpgo.AuthProtocol {
-	var authProtocol snmpgo.AuthProtocol
+func getSNMPAuthProtocol(s string) gosnmp.SnmpV3AuthProtocol {
+	var authProtocol gosnmp.SnmpV3AuthProtocol
 	switch s {
 	case "MD5":
-		authProtocol = snmpgo.Md5
+		authProtocol = gosnmp.MD5
 	case "SHA":
-		authProtocol = snmpgo.Sha
+		authProtocol = gosnmp.SHA
 	}
 	return authProtocol
 }
 
-func getPrivProtocol(s string) snmpgo.PrivProtocol {
-	var privProtocol snmpgo.PrivProtocol
+func getPrivProtocol(s string) gosnmp.SnmpV3PrivProtocol {
+	var privProtocol gosnmp.SnmpV3PrivProtocol
 	switch s {
 	case "DES":
-		privProtocol = snmpgo.Des
+		privProtocol = gosnmp.DES
 	case "AES":
-		privProtocol = snmpgo.Aes
+		privProtocol = gosnmp.AES
 	}
 	return privProtocol
 }

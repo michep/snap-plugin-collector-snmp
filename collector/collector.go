@@ -23,17 +23,15 @@ package collector
 import (
 	"fmt"
 	"regexp"
-	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/intelsdi-x/snap-plugin-collector-snmp/collector/configReader"
 	"github.com/intelsdi-x/snap-plugin-collector-snmp/collector/snmp"
 	"github.com/intelsdi-x/snap-plugin-lib-go/v1/plugin"
 	"github.com/intelsdi-x/snap/core"
-	"github.com/k-sone/snmpgo"
 	log "github.com/sirupsen/logrus"
+	"github.com/soniah/gosnmp"
 )
 
 const (
@@ -72,27 +70,20 @@ type Plugin struct {
 }
 
 type connection struct {
-	handler  *snmpgo.SNMP
-	mtx      *sync.Mutex
+	handler  *gosnmp.GoSNMP
 	lastUsed time.Time
 }
 
 type snmpType struct{}
 
 type snmpInterface interface {
-	newHandler(hostConfig configReader.SnmpAgent) (*snmpgo.SNMP, error)
-	readElements(handler *snmpgo.SNMP, oid string, mode string) ([]*snmpgo.VarBind, error)
+	newHandler(hostConfig configReader.SnmpAgent) (*gosnmp.GoSNMP, error)
+	readElements(handler *gosnmp.GoSNMP, oid string, mode string) ([]gosnmp.SnmpPDU, error)
 }
 
 var (
-	snmp_              = snmpInterface(&snmpType{})
-	snmpConnections    = make(map[string]connection)
-	mtxSnmpConnections = &sync.Mutex{}
+	snmp_ = snmpInterface(&snmpType{})
 )
-
-func init() {
-	go watchConnections()
-}
 
 // New creates initialized instance of snmp collector
 func New() *Plugin {
@@ -181,10 +172,6 @@ func (p *Plugin) CollectMetrics(metrics []plugin.Metric) ([]plugin.Metric, error
 		return nil, err
 	}
 
-	//lock using of connections in watchConnections
-	mtxSnmpConnections.Lock()
-	defer mtxSnmpConnections.Unlock()
-
 	conn, err := getConnection(agentConfig)
 	if err != nil {
 		return nil, err
@@ -236,7 +223,7 @@ func (p *Plugin) CollectMetrics(metrics []plugin.Metric) ([]plugin.Metric, error
 				}
 
 				//convert metric types
-				val, err := convertSnmpDataToMetric(result.Variable.String(), result.Variable.Type())
+				val, err := convertSnmpDataToMetric(result.Value, result.Type)
 				if err != nil {
 					log.Warn(err)
 					continue
@@ -253,7 +240,7 @@ func (p *Plugin) CollectMetrics(metrics []plugin.Metric) ([]plugin.Metric, error
 					Tags: map[string]string{
 						tagSnmpAgentName:    agentConfig.Name,
 						tagSnmpAgentAddress: agentConfig.Address,
-						tagOid:              result.Oid.String()},
+						tagOid:              result.Name},
 					Unit:        metric.Unit,
 					Description: metric.Description,
 				}
@@ -290,49 +277,26 @@ func (p *Plugin) GetConfigPolicy() (plugin.ConfigPolicy, error) {
 }
 
 //NewHandler creates new connection with SNMP agent
-func (s *snmpType) newHandler(hostConfig configReader.SnmpAgent) (*snmpgo.SNMP, error) {
+func (s *snmpType) newHandler(hostConfig configReader.SnmpAgent) (*gosnmp.GoSNMP, error) {
 	return snmp.NewHandler(hostConfig)
 }
 
 //ReadElements reads data using SNMP requests
-func (s *snmpType) readElements(handler *snmpgo.SNMP, oid string, mode string) ([]*snmpgo.VarBind, error) {
+func (s *snmpType) readElements(handler *gosnmp.GoSNMP, oid string, mode string) ([]gosnmp.SnmpPDU, error) {
 	return snmp.ReadElements(handler, oid, mode)
 }
 
 //getConnection gets connection with SNMP agent, checks if connection with specified SNMP agent exists, if not a new connection is initialized
 func getConnection(agentConfig configReader.SnmpAgent) (connection, error) {
-	if conn, ok := snmpConnections[agentConfig.Address]; ok {
-		return conn, nil
+	handler, serr := snmp_.newHandler(agentConfig)
+	if serr != nil {
+		return connection{}, serr
 	}
-	handler, err := snmp_.newHandler(agentConfig)
-	if err != nil {
-		return connection{}, err
-	}
-	snmpConnections[agentConfig.Address] = connection{handler: handler, mtx: &sync.Mutex{}}
-	return snmpConnections[agentConfig.Address], nil
-}
-
-//watchConnections observes SNMP connections and closes unused connections
-func watchConnections() {
-	for {
-		time.Sleep(connectionWait)
-		mtxSnmpConnections.Lock()
-		for k := range snmpConnections {
-			if time.Now().Sub(snmpConnections[k].lastUsed) > connectionIdle {
-
-				//close the connection
-				snmpConnections[k].handler.Close()
-
-				//remove the connection
-				delete(snmpConnections, k)
-			}
-		}
-		mtxSnmpConnections.Unlock()
-	}
+	return connection{handler: handler}, nil
 }
 
 //getDynamicNamespaceElements gets dynamic elements of namespace, either sending SNMP requests or using part of OID
-func getDynamicNamespaceElements(handler *snmpgo.SNMP, resultMap map[string]*snmpgo.VarBind, metric *configReader.Metric) error {
+func getDynamicNamespaceElements(handler *gosnmp.GoSNMP, resultMap map[string]gosnmp.SnmpPDU, metric *configReader.Metric) error {
 	for i := 0; i < len(metric.Namespace); i++ {
 		//clear slice with dynamic parts of namespace
 		metric.Namespace[i].Values = make(map[string]string)
@@ -353,16 +317,23 @@ func getDynamicNamespaceElements(handler *snmpgo.SNMP, resultMap map[string]*snm
 				return serr
 			}
 
+			val := ""
 			for idx, part := range partsMap {
 				if _, ok := resultMap[idx]; ok {
-					metricNamePart := ReplaceNotAllowedCharsInNamespacePart(part.Variable.String())
+					switch part.Type {
+					case gosnmp.OctetString:
+						val = string(part.Value.([]byte))
+					default:
+						val = string(int64(part.Value.(int64)))
+					}
+					metricNamePart := ReplaceNotAllowedCharsInNamespacePart(val)
 					metric.Namespace[i].Values[idx] = metricNamePart
 				}
 			}
 
 		case configReader.NsSourceIndex:
 			for _, r := range resultMap {
-				oidParts := strings.Split(strings.Trim(r.Oid.String(), "."), ".")
+				oidParts := strings.Split(strings.Trim(r.Name, "."), ".")
 
 				if uint(len(oidParts)) <= metric.Namespace[i].OidPart {
 
@@ -420,19 +391,23 @@ func getMetricsToCollect(namespace string, metrics map[string]configReader.Metri
 }
 
 //convertSnmpDataToMetric converts data received using SNMP request to supported data type
-func convertSnmpDataToMetric(snmpData string, snmpType string) (interface{}, error) {
+func convertSnmpDataToMetric(snmpData interface{}, snmpType gosnmp.Asn1BER) (interface{}, error) {
 	var val interface{}
 	var err error
 
-	switch snmpType {
-	case "Counter", "Counter32", "Gauge32", "UInteger32", "TimeTicks":
-		val, err = strconv.ParseUint(snmpData, 10, 32)
-	case "Counter64":
-		val, err = strconv.ParseUint(snmpData, 10, 64)
-	case "Integer", "Integer32":
-		val, err = strconv.ParseInt(snmpData, 10, 32)
-	case "OctetString", "IpAddress", "Object Identifier":
-		val = snmpData
+	switch snmpData.(type) {
+	case uint:
+		val = uint32(snmpData.(uint))
+	case uint32:
+		val = uint32(snmpData.(uint32))
+	case uint64:
+		val = uint64(snmpData.(uint64))
+	case int:
+		val = int32(snmpData.(int))
+	case int32:
+		val = int32(snmpData.(int32))
+	case string:
+		val = snmpData.(string)
 	default:
 		log.WithFields(log.Fields{"data": snmpData, "type": snmpType}).Warn(
 			fmt.Errorf("Unrecognized type of data, metric is returned as string"))
@@ -471,13 +446,13 @@ func modifyNumericMetric(data interface{}, scale float64, shift float64) interfa
 	return modifiedData
 }
 
-func snmpResults2Map(results []*snmpgo.VarBind, oid string) (map[string]*snmpgo.VarBind, error) {
+func snmpResults2Map(results []gosnmp.SnmpPDU, oid string) (map[string]gosnmp.SnmpPDU, error) {
 	index := ""
-	res := make(map[string]*snmpgo.VarBind)
+	res := make(map[string]gosnmp.SnmpPDU)
 	oidTrimmed := strings.Trim(oid, ".")
 	oidLen := len(strings.Split(oidTrimmed, "."))
 	for _, r := range results {
-		roidTrimmed := strings.Trim(r.Oid.String(), ".")
+		roidTrimmed := strings.Trim(r.Name, ".")
 		roidLen := len(strings.Split(roidTrimmed, "."))
 		if ((roidLen == oidLen) || (roidLen == oidLen+1)) && strings.HasPrefix(roidTrimmed, oidTrimmed) {
 			if roidLen == oidLen+1 {
